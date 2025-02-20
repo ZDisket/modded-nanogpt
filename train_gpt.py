@@ -282,6 +282,26 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
         return y
 
+@torch.jit.script
+def relugt_forward(x, slope, alpha_neg, alpha_pos):
+    return torch.where(x < 0, alpha_neg * slope * x, alpha_pos * x ** 2)
+
+class ReLUGT(nn.Module):
+    """
+    ReLU GT: Leaky squared ReLU with trainable positive alpha, slope, and static negative alpha. Only squares positive part.
+
+    5x faster when forward pass is torch.jit.script
+    """
+    def __init__(self, initial_slope=0.05, initial_alpha_neg=2.5, initial_alpha_pos=1.0):
+        super(ReLUGT, self).__init__()
+        self.slope = nn.Parameter(torch.tensor(initial_slope))
+        self.alpha_neg = initial_alpha_neg # This one is static.
+        self.alpha_pos = nn.Parameter(torch.tensor(initial_alpha_pos))
+
+    def forward(self, x):
+        return relugt_forward(x, self.slope, self.alpha_neg, self.alpha_pos)
+
+# MLP (ReLU2)
 class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -296,12 +316,90 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
+# https://github.com/facebookresearch/dinov2/blob/e1277af2ba9496fbadf7aec6eba56e8d882d1e35/dinov2/layers/swiglu_ffn.py#L14
+class MLPSwiGLU(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        hdim = 4 * dim
+        self.c_fc1 = CastedLinear(dim, hdim * 2)  # For the first linear layer and gating
+        self.c_proj = CastedLinear(hdim, dim)
+        self.c_proj.weight.detach().zero_()
+
+    def forward(self, x: Tensor):
+        x1 = self.c_fc1(x)
+        x1, gate = x1.chunk(2, dim=-1)
+        x = F.silu(x1) * gate # Element-wise multiplication for gating
+        x = self.c_proj(x)
+        return x
+
+
+class MLPGeGLU(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        hdim = 4 * dim
+        self.c_fc1 = CastedLinear(dim, hdim * 2)  # For the first linear layer and gating
+        self.c_proj = CastedLinear(hdim, dim)
+        self.c_proj.weight.detach().zero_()
+
+    def forward(self, x: Tensor):
+        x1 = self.c_fc1(x)
+        x1, gate = x1.chunk(2, dim=-1)
+        x = F.gelu(x1) * gate # Element-wise multiplication for gating
+        x = self.c_proj(x)
+        return x
+
+class MLPReLUGT(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        hdim = 4 * dim
+        self.c_fc = CastedLinear(dim, hdim)
+        self.c_proj = CastedLinear(hdim, dim)
+        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        self.relu_gt = ReLUGT()
+
+    def forward(self, x: Tensor):
+        x = self.c_fc(x)
+        x = self.relu_gt(x)
+        x = self.c_proj(x)
+        return x
+
+class MLPReLUGTz(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        hdim = 4 * dim
+        self.c_fc1 = CastedLinear(dim, hdim * 2)  # For the first linear layer and gating
+        self.c_proj = CastedLinear(hdim, dim)
+        self.relu_gt = ReLUGT()
+        self.c_proj.weight.detach().zero_()
+
+    def forward(self, x: Tensor):
+        x1 = self.c_fc1(x)
+        x1, gate = x1.chunk(2, dim=-1)
+        x = self.relu_gt(x1) * gate # Element-wise multiplication for gating
+        x = self.c_proj(x)
+        return x
+
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int, act: str):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
-        self.mlp = MLP(dim)
+
+        # There's definitely a more elegant way to do this, but I'm just doing this quickly.
+
+        if act == "relu2":
+            self.mlp = MLP(dim)
+        elif act == "relugt":
+            self.mlp = MLPReLUGT(dim)
+        elif act == "relugtz":
+            self.mlp = MLPReLUGTz(dim)
+        elif act == "swiglu":
+            self.mlp = MLPSwiGLU(dim)
+        elif act == "geglu":
+            self.mlp = MLPGeGLU(dim)
+        else:
+            raise RuntimeError(f"Unknown activation function {act}")
+
         self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
@@ -318,13 +416,13 @@ def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int, act: str):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i, act) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         self.lm_head = CastedLinear(model_dim, next_multiple_of_n(vocab_size, n=128),
@@ -454,6 +552,7 @@ class Hyperparameters:
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
+    act = "relu2" # out of relu2, relugt, relugtz, swiglu, geglu
 args = Hyperparameters()
 
 # torchrun sets these env variables
@@ -498,7 +597,7 @@ print0("="*100)
 ########################################
 
 model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=12, num_heads=6, model_dim=768,
-                       max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
+                       max_seq_len=max(args.train_seq_len, args.val_seq_len), act=args.act).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
