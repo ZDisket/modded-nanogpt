@@ -733,6 +733,16 @@ for step in range(train_steps + 1):
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
+if args.act in ["relugt", "relugtz"]:
+    for i, block in enumerate(model.blocks):
+        # For ReLUGT, the activation is inside mlp.relu_gt
+        relugt_activation = block.mlp.relu_gt
+        print0(f"Block {i} ReLUGT trainable parameters:")
+        for name, param in relugt_activation.named_parameters():
+            print0(f"  {name}: shape {param.shape}, value = {param.data}")
+
+
+
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
 dist.destroy_process_group()
